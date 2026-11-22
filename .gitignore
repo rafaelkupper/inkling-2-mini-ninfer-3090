@@ -1,5 +1,8 @@
 /models/
 /results/
+/build/
+/engine-src/
+/gguf-py/
 __pycache__/
 *.pyc
 .env

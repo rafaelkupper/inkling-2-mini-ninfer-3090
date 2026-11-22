@@ -7,7 +7,7 @@ derived from Neroued/ninfer and the Don-Chad and ashalliants NInfer-3090 forks.
 Upstream revision: 395ce8b85627bcb2d53a1a81623088eab755443c (Apache-2.0).
 Upstream authors and lineage:
 https://github.com/iamwavecut/ninfer-all/blob/395ce8b85627bcb2d53a1a81623088eab755443c/CONTRIBUTORS.md
-The two patch files identify the modified and added source files.
+The patch files identify the modified and added source files.
 
 Thinking Machines Lab provides Inkling 2 Mini, DSpark and the tokenizer.
 Unsloth provides the GGUF quantization, vision projector and drafter GGUF.

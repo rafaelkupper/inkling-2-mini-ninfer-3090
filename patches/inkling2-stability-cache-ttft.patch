@@ -1,0 +1,908 @@
+diff --git a/src/models/qwen3_5/frontend/frontend.cpp b/src/models/qwen3_5/frontend/frontend.cpp
+--- a/src/models/qwen3_5/frontend/frontend.cpp
++++ b/src/models/qwen3_5/frontend/frontend.cpp
+@@ -1116,13 +1116,34 @@
+             return;
+         }
+         if (options.architecture == Architecture::Inkling2) {
+-            // Inkling writes its blocks' headers itself and decides whether it reasons, at the
+-            // effort level its prompt names; it has no early-close control, so thinking budgets do
+-            // not apply.
++            // Inkling opens its own <|content_thinking|> block and closes it with <|end_message|>.
++            // Early-close control (for --reasoning-loop conclude and --default-thinking-budget)
++            // injects concise conclusion guidance followed by <|end_message|> so Inkling exits
++            // reasoning cleanly and immediately emits either a text answer or a tool call.
+             inkling = std::make_shared<const fi::InklingMarkers>(fi::InklingMarkers::from(*tokenizer));
+             if (!inkling->complete()) {
+                 throw std::invalid_argument("Inkling's tokenizer lacks its block markers");
+             }
++            std::string guidance =
++                "\n\nConsidering the limited time by the user, I have to act or give the solution "
++                "based on the thinking directly now.\n";
++            if (!options.thinking_budget_message.empty()) {
++                guidance = options.thinking_budget_message;
++                if (const auto close = guidance.find(fi::kInklingEnd); close != std::string::npos) {
++                    guidance.erase(close);
++                }
++            }
++            std::vector<TokenId> encoded = tokenizer->encode(guidance);
++            encoded.push_back(inkling->end);
++            for (const TokenId token : encoded) {
++                if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), token) !=
++                    defaults.token_ids.end()) {
++                    throw std::invalid_argument("thinking budget message contains a default "
++                                                "terminal token");
++                }
++            }
++            thinking_control_tokens =
++                std::make_shared<const std::vector<TokenId>>(std::move(encoded));
+             return;
+         }
+         if (options.architecture == Architecture::DeepSeekV41) {
+diff --git a/src/models/qwen3_5/frontend/output_session.cpp b/src/models/qwen3_5/frontend/output_session.cpp
+--- a/src/models/qwen3_5/frontend/output_session.cpp
++++ b/src/models/qwen3_5/frontend/output_session.cpp
+@@ -239,6 +239,7 @@
+     std::string loop_tail;
+     std::vector<std::uint64_t> loop_round;
+     std::uint32_t loop_next_check      = kLoopCheckTokens;
++    std::uint32_t loop_short_hits      = 0;
+     bool loop_detected                 = false;
+     std::uint32_t loop_thinking_tokens = 0;
+     float loop_coverage                = 0.0F;
+@@ -629,14 +630,14 @@
+     [[nodiscard]] bool model_opens_reasoning() const noexcept { return gemma || flint || inkling; }
+ 
+     // The repeated-passage coverage of the committed thinking plus the previewed round's words.
+-    [[nodiscard]] double loop_coverage(const std::vector<std::uint64_t>& round) const {
++    [[nodiscard]] LoopCoverage loop_coverage_detail(const std::vector<std::uint64_t>& round) const {
+         const std::size_t keep =
+             kLoopHistoryWords > round.size() ? kLoopHistoryWords - round.size() : 0;
+         std::vector<std::uint64_t> words(
+             loop_words.end() - static_cast<std::ptrdiff_t>(std::min(keep, loop_words.size())),
+             loop_words.end());
+         words.insert(words.end(), round.begin(), round.end());
+-        return repeated_passage_coverage(words);
++        return repeated_passage_coverage_detail(words);
+     }
+ 
+     // Whether the loop guard reads this point of the output: Qwen's thinking, opened by the prompt
+@@ -646,16 +647,19 @@
+         return model_opens_reasoning() ? decoder.in_reasoning : thinking.in_reasoning;
+     }
+ 
+-    // Moves the committed round's words into the history (bounded); drops it once thinking ends.
++    // Moves the committed round's words into the history (bounded). For models that can reopen
++    // thinking blocks across a single response (e.g. Inkling), retain loop history across natural
++    // block closes so alternating short thinking/text blocks cannot evade detection.
+     void commit_loop_words() {
+-        if (!loop_reasoning(state, semantic) || semantic.loop == ReasoningLoopAction::Off ||
+-            semantic.loop_detected) {
++        if (semantic.loop == ReasoningLoopAction::Off || semantic.loop_detected ||
++            (!model_opens_reasoning() && !loop_reasoning(state, semantic))) {
+             loop_words.clear();
+             loop_words.shrink_to_fit();
+             semantic.loop_round.clear();
+             semantic.loop_tail.clear();
+             return;
+         }
++        if (semantic.loop_round.empty()) { return; }
+         loop_words.insert(loop_words.end(), semantic.loop_round.begin(), semantic.loop_round.end());
+         semantic.loop_round.clear();
+         if (loop_words.size() > 2 * kLoopHistoryWords) {
+@@ -880,7 +884,13 @@
+         // A token that confirms a held close (its first byte is a line break, or it ends the
+         // turn) is the first one after the thinking, so neither count includes it.
+         const bool presentation_held = holds_presentation_close(impl_->preview_state);
+-        if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
++        if (impl_->preview_state.in_reasoning) {
++            ++impl_->preview_state.reasoning_tokens;
++            if (impl_->inkling && token != impl_->inkling->end && token != impl_->inkling->header &&
++                !impl_->inkling->content(token)) {
++                ++impl_->preview_semantic.model_thinking_tokens;
++            }
++        }
+         SemanticThinkingState& thinking = impl_->preview_semantic;
+         // DeepSeek's </think> token closes its reasoning whatever follows it; a line break after
+         // it is what closes the channel for the scans, and the content's leading break is dropped.
+@@ -1018,6 +1028,22 @@
+         }
+         count_fed_token(impl_->preview_state);
+         release_logprobs(impl_->preview_state, impl_->preview_logprobs);
++        // Enforce Inkling's thinking budget per token so a speculative span starting outside
++        // reasoning (e.g. in a header) cannot cross <|content_thinking|>, exceed the budget, or
++        // open and close an entire thinking block within one round.
++        if (impl_->inkling && impl_->early_close_available && impl_->preview_state.in_reasoning &&
++            !impl_->preview_semantic.applied && impl_->preview_semantic.budget &&
++            impl_->preview_semantic.model_thinking_tokens >= *impl_->preview_semantic.budget) {
++            const std::uint64_t control =
++                impl_->thinking_control_tokens ? impl_->thinking_control_tokens->size() : 0U;
++            const std::uint64_t remaining = total_budget_remaining - count;
++            if (control > 0 && remaining >= control + 1U) {
++                note_stop_hold(false);
++                impl_->preview_semantic.control_pending = true;
++                return complete(count, FinishReason::None,
++                                runtime::ContinuationAction::ApplyTargetControl);
++            }
++        }
+     }
+     note_stop_hold(false);
+ 
+@@ -1045,21 +1071,42 @@
+     // and Flint count the tokens of the reasoning they opened; they have no early-close control,
+     // so they stop. A held close marker defers the check to the next round, which resolves it.
+     SemanticThinkingState& semantic     = impl_->preview_semantic;
+-    const std::uint32_t thinking_tokens = impl_->model_opens_reasoning()
+-                                              ? impl_->preview_state.reasoning_tokens
+-                                              : semantic.model_thinking_tokens;
++    const std::uint32_t thinking_tokens = impl_->inkling
++                                              ? semantic.model_thinking_tokens
++                                              : impl_->model_opens_reasoning()
++                                                    ? impl_->preview_state.reasoning_tokens
++                                                    : semantic.model_thinking_tokens;
+     if (semantic.loop != ReasoningLoopAction::Off &&
+         impl_->loop_reasoning(impl_->preview_state, semantic) && !semantic.applied &&
+         !semantic.loop_detected && !holds_semantic_close(semantic) &&
+         thinking_tokens >= semantic.loop_next_check) {
+         semantic.loop_next_check = (thinking_tokens / kLoopCheckTokens + 1U) * kLoopCheckTokens;
+         // Strata reads a periodic tail as full coverage before its word measure; a tail that is
+-        // periodic around a counter reads the same.
+-        const double coverage =
+-            periodic_tail(semantic.loop_tail) || counting_tail(semantic.loop_tail)
+-                ? 1.0
+-                : impl_->loop_coverage(semantic.loop_round);
+-        if (coverage >= kLoopCoverage) {
++        // periodic around a counter (at >= 2048 chars) reads the same. The early 512-word window
++        // only triggers within the first kLoopShortMaxTok thinking tokens AND after kLoopShortConfirm
++        // consecutive hits to prevent false positives on code re-drafting.
++        double coverage = 0.0;
++        bool triggered  = false;
++        if (periodic_tail(semantic.loop_tail) || counting_tail(semantic.loop_tail)) {
++            coverage  = 1.0;
++            triggered = true;
++        } else {
++            const LoopCoverage detail = impl_->loop_coverage_detail(semantic.loop_round);
++            if (detail.long_window >= kLoopCoverage) {
++                coverage  = detail.long_window;
++                triggered = true;
++            } else if (thinking_tokens <= kLoopShortMaxTok &&
++                       detail.short_window >= kLoopShortCoverage) {
++                ++semantic.loop_short_hits;
++                if (semantic.loop_short_hits >= kLoopShortConfirm) {
++                    coverage  = detail.short_window;
++                    triggered = true;
++                }
++            } else {
++                semantic.loop_short_hits = 0;
++            }
++        }
++        if (triggered) {
+             semantic.loop_detected        = true;
+             semantic.loop_thinking_tokens = thinking_tokens;
+             semantic.loop_coverage        = static_cast<float>(coverage);
+@@ -1086,10 +1133,17 @@
+ OutputSession::model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept {
+     // A pending control span (a reached budget's or the loop guard's) licenses no model token.
+     if (impl_ != nullptr && impl_->semantic.control_pending) { return 0; }
+-    if (impl_ == nullptr || !impl_->semantic.budget || !impl_->semantic.in_reasoning ||
+-        impl_->semantic.applied || !impl_->early_close_available) {
++    if (impl_ == nullptr || !impl_->semantic.budget || impl_->semantic.applied ||
++        !impl_->early_close_available) {
+         return total_budget_remaining;
+     }
++    if (impl_->inkling) {
++        if (!impl_->state.in_reasoning) { return total_budget_remaining; }
++        if (impl_->semantic.model_thinking_tokens >= *impl_->semantic.budget) { return 0; }
++        return std::min(total_budget_remaining,
++                        *impl_->semantic.budget - impl_->semantic.model_thinking_tokens);
++    }
++    if (!impl_->semantic.in_reasoning) { return total_budget_remaining; }
+     if (impl_->semantic.control_pending ||
+         impl_->semantic.model_thinking_tokens >= *impl_->semantic.budget) {
+         return 0;
+@@ -1110,7 +1164,9 @@
+         impl_->semantic.applied) {
+         return 0;
+     }
+-    return impl_->semantic.control_pending || impl_->semantic.in_reasoning
++    const bool active_reasoning =
++        impl_->inkling ? impl_->state.in_reasoning : impl_->semantic.in_reasoning;
++    return impl_->semantic.control_pending || active_reasoning
+                ? static_cast<std::uint32_t>(impl_->thinking_control_tokens->size())
+                : 0U;
+ }
+@@ -1143,6 +1199,17 @@
+             impl_->preview_execution_split_after = static_cast<std::uint32_t>(index + 1U);
+         }
+         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
++        if (impl_->inkling) {
++            const std::string_view raw_bytes =
++                !impl_->preserve_special && decoded.special ? std::string_view{} : decoded.bytes;
++            const std::string_view presentation_bytes = inkling_bytes(
++                *impl_->inkling, impl_->preview_state, token, raw_bytes,
++                impl_->inkling_tools.has_value());
++            feed_token_bytes(impl_->preview_state, presentation_bytes, impl_->policy,
++                             impl_->preview_output, static_cast<std::uint32_t>(index + 1), nullptr);
++            count_fed_token(impl_->preview_state);
++            continue;
++        }
+         // DeepSeek's </think> token closes its reasoning whatever follows it, as in its own output.
+         const bool deepseek_close = impl_->deepseek && token == impl_->deepseek->think_close;
+         const std::string_view thinking_bytes =
+@@ -1160,7 +1227,7 @@
+     if (impl_->preview_semantic.in_reasoning) {
+         throw std::logic_error("canonical thinking control did not close the thinking phase");
+     }
+-    if (impl_->split_reasoning && impl_->preview_state.in_reasoning) {
++    if ((impl_->split_reasoning || impl_->inkling) && impl_->preview_state.in_reasoning) {
+         throw std::logic_error("canonical thinking control did not close the reasoning channel");
+     }
+     impl_->preview_semantic.control_pending = false;
+@@ -1297,7 +1364,20 @@
+ }
+ 
+ bool OutputSession::reasoning_closed() const noexcept {
+-    return impl_ != nullptr && impl_->started_in_reasoning && !impl_->prefix_execution.tracking;
++    if (impl_ == nullptr) { return false; }
++    if (impl_->inkling) {
++        return impl_->semantic.applied ||
++               (impl_->state.reasoning_tokens > 0 && !impl_->state.in_reasoning);
++    }
++    return impl_->started_in_reasoning && !impl_->prefix_execution.tracking;
++}
++
++std::optional<TokenId> OutputSession::banned_token() const noexcept {
++    if (impl_ == nullptr || !impl_->inkling || !impl_->semantic.applied) { return std::nullopt; }
++    // Keep <|content_thinking|> banned (and speculation disabled) for the remainder of an
++    // early-closed response so a multi-token speculative span cannot close a text/tool block,
++    // traverse a header, and re-open thinking unmasked.
++    return impl_->inkling->thinking;
+ }
+ 
+ ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
+@@ -1305,7 +1385,7 @@
+     return ThinkingBudgetStats{
+         .requested_budget = impl_->requested_budget,
+         // Without early close the cap is never enforced, so there is no effective budget.
+-        .effective_budget = impl_->early_close_available ? impl_->semantic.budget : std::nullopt,
++        .effective_budget      = impl_->early_close_available ? impl_->semantic.budget : std::nullopt,
+         .model_thinking_tokens = impl_->semantic.model_thinking_tokens,
+         .injected_tokens       = impl_->semantic.injected_tokens,
+         .applied               = impl_->semantic.applied,
+diff --git a/src/models/qwen3_5/frontend/output_session.h b/src/models/qwen3_5/frontend/output_session.h
+--- a/src/models/qwen3_5/frontend/output_session.h
++++ b/src/models/qwen3_5/frontend/output_session.h
+@@ -94,6 +94,8 @@
+     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;
+     // True once a session that began inside a reasoning block has committed its close.
+     [[nodiscard]] bool reasoning_closed() const noexcept;
++    // Token ID suppressed after early-close conclusion so Inkling cannot re-open thinking.
++    [[nodiscard]] std::optional<TokenId> banned_token() const noexcept;
+     [[nodiscard]] std::optional<std::string> matched_stop_string() const;
+ 
+ private:
+diff --git a/src/models/qwen3_5/frontend/reasoning_loop.cpp b/src/models/qwen3_5/frontend/reasoning_loop.cpp
+--- a/src/models/qwen3_5/frontend/reasoning_loop.cpp
++++ b/src/models/qwen3_5/frontend/reasoning_loop.cpp
+@@ -149,33 +149,20 @@
+     }
+ }
+ 
+-double repeated_passage_coverage(std::span<const std::uint64_t> words) {
+-    const std::size_t n = words.size();
+-    if (n < kLoopWindowWords || n < kLoopPassageWords) { return 0.0; }
+-    // Polynomial hash of every passage, rolled along the words.
+-    constexpr std::uint64_t kBase = 0x9E3779B97F4A7C15ULL;
+-    std::uint64_t top             = 1; // kBase^(kLoopPassageWords - 1)
+-    for (std::size_t i = 1; i < kLoopPassageWords; ++i) { top *= kBase; }
+-    const std::size_t passages = n - kLoopPassageWords + 1;
+-    std::vector<std::uint64_t> hashes(passages);
+-    std::uint64_t hash = 0;
+-    for (std::size_t i = 0; i < kLoopPassageWords; ++i) { hash = hash * kBase + words[i]; }
+-    hashes[0] = hash;
+-    for (std::size_t i = 1; i < passages; ++i) {
+-        hash      = (hash - words[i - 1] * top) * kBase + words[i + kLoopPassageWords - 1];
+-        hashes[i] = hash;
+-    }
+-    std::unordered_map<std::uint64_t, std::uint32_t> counts;
+-    counts.reserve(passages);
+-    for (const std::uint64_t h : hashes) { ++counts[h]; }
+-
+-    // Mark the window's words that lie inside a repeated passage (a difference array over starts).
+-    const std::size_t window_start = n - kLoopWindowWords;
+-    std::vector<int> delta(kLoopWindowWords + 1, 0);
++namespace {
++
++double window_coverage_from_counts(const std::vector<std::uint64_t>& hashes,
++                                   const std::unordered_map<std::uint64_t, std::uint32_t>& counts,
++                                   std::size_t n, std::size_t window_words) {
++    if (n < window_words || hashes.empty()) { return 0.0; }
++    const std::size_t passages     = hashes.size();
++    const std::size_t window_start = n - window_words;
++    std::vector<int> delta(window_words + 1, 0);
+     const std::size_t first =
+         window_start >= kLoopPassageWords - 1 ? window_start - (kLoopPassageWords - 1) : 0;
+     for (std::size_t i = first; i < passages; ++i) {
+-        if (counts[hashes[i]] < kLoopRepeats) { continue; }
++        const auto it = counts.find(hashes[i]);
++        if (it == counts.end() || it->second < kLoopRepeats) { continue; }
+         const std::size_t begin = std::max(i, window_start) - window_start;
+         const std::size_t end   = std::min(i + kLoopPassageWords, n) - window_start;
+         ++delta[begin];
+@@ -183,32 +170,16 @@
+     }
+     std::size_t covered = 0;
+     int depth           = 0;
+-    for (std::size_t p = 0; p < kLoopWindowWords; ++p) {
++    for (std::size_t p = 0; p < window_words; ++p) {
+         depth += delta[p];
+         covered += depth > 0 ? 1U : 0U;
+     }
+-    return static_cast<double>(covered) / static_cast<double>(kLoopWindowWords);
+-}
+-
+-void append_tail(std::string_view bytes, std::string& tail) {
+-    tail.append(bytes);
+-    // A character is at most four bytes, so the last 4 * kLoopTailChars bytes always hold the last
+-    // kLoopTailChars characters; the buffer is cut only once it is twice that.
+-    constexpr std::size_t kKeep = 4U * kLoopTailChars;
+-    if (tail.size() > 2U * kKeep) { tail.erase(0, tail.size() - kKeep); }
+-}
+-
+-bool periodic_tail(std::string_view text) {
+-    const TailSpan span = tail_span(text, kLoopTailChars);
+-    if (span.characters < kLoopTailChars) { return false; }
+-    return character_period(text.substr(span.begin)) != 0;
+-}
+-
+-bool counting_tail(std::string_view text) {
+-    const TailSpan span = tail_span(text, kLoopTailChars);
+-    if (span.characters < kLoopTailChars) { return false; }
+-    // Every run of ASCII digits becomes one 0xff byte, which UTF-8 never holds, and its value is
+-    // kept, held far above any counter's.
++    return static_cast<double>(covered) / static_cast<double>(window_words);
++}
++
++bool counting_tail_window(std::string_view text, std::size_t tail_chars) {
++    const TailSpan span = tail_span(text, tail_chars);
++    if (span.characters < tail_chars) { return false; }
+     constexpr std::uint64_t kHeld = 1'000'000'000'000'000ULL;
+     std::string masked;
+     std::vector<std::uint64_t> numbers;
+@@ -230,11 +201,7 @@
+     if (period == 0) { return false; }
+     const auto slots = static_cast<std::size_t>(
+         std::count(masked.begin(), masked.begin() + std::ptrdiff_t(period), static_cast<char>(0xff)));
+-    if (slots == 0) { return false; } // a plain period, which periodic_tail reads
+-    // Runs i and i + slots are one number of two consecutive periods. The first and the last run
+-    // may be cut by the tail's ends, so neither is read. Every number of the period keeps one step
+-    // (a constant's is zero) and one of them moves: a counter beside numbers that change otherwise
+-    // is an enumeration of worked values ("step 7 checks value 4821"), not a loop.
++    if (slots == 0) { return false; }
+     bool moves = false;
+     for (std::size_t first = 1; first <= slots; ++first) {
+         std::int64_t step = 0;
+@@ -252,4 +219,59 @@
+     return moves;
+ }
+ 
++} // namespace
++
++LoopCoverage repeated_passage_coverage_detail(std::span<const std::uint64_t> words) {
++    const std::size_t n = words.size();
++    if (n < kLoopShortWindow || n < kLoopPassageWords) { return {}; }
++    constexpr std::uint64_t kBase = 0x9E3779B97F4A7C15ULL;
++    std::uint64_t top             = 1;
++    for (std::size_t i = 1; i < kLoopPassageWords; ++i) { top *= kBase; }
++    const std::size_t passages = n - kLoopPassageWords + 1;
++    std::vector<std::uint64_t> hashes(passages);
++    std::uint64_t hash = 0;
++    for (std::size_t i = 0; i < kLoopPassageWords; ++i) { hash = hash * kBase + words[i]; }
++    hashes[0] = hash;
++    for (std::size_t i = 1; i < passages; ++i) {
++        hash      = (hash - words[i - 1] * top) * kBase + words[i + kLoopPassageWords - 1];
++        hashes[i] = hash;
++    }
++    // Single hash-map build shared by both long and short windows.
++    std::unordered_map<std::uint64_t, std::uint32_t> counts;
++    counts.reserve(passages);
++    for (const std::uint64_t h : hashes) { ++counts[h]; }
++    return LoopCoverage{
++        .long_window  = window_coverage_from_counts(hashes, counts, n, kLoopWindowWords),
++        .short_window = window_coverage_from_counts(hashes, counts, n, kLoopShortWindow),
++    };
++}
++
++double repeated_passage_coverage(std::span<const std::uint64_t> words) {
++    return repeated_passage_coverage_detail(words).long_window;
++}
++
++void append_tail(std::string_view bytes, std::string& tail) {
++    tail.append(bytes);
++    // A character is at most four bytes, so the last 4 * kLoopTailChars bytes always hold the last
++    // kLoopTailChars characters; the buffer is cut only once it is twice that.
++    constexpr std::size_t kKeep = 4U * kLoopTailChars;
++    if (tail.size() > 2U * kKeep) { tail.erase(0, tail.size() - kKeep); }
++}
++
++bool periodic_tail(std::string_view text) {
++    for (const std::size_t limit : {kLoopShortTailChars, kLoopTailChars}) {
++        const TailSpan span = tail_span(text, limit);
++        if (span.characters >= limit && character_period(text.substr(span.begin)) != 0) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool counting_tail(std::string_view text) {
++    // Require full kLoopTailChars (2048 chars) so short numbered enumerations (e.g. test suites)
++    // do not false-positive.
++    return counting_tail_window(text, kLoopTailChars);
++}
++
+ } // namespace ninfer::models::qwen3_5
+diff --git a/src/models/qwen3_5/frontend/reasoning_loop.h b/src/models/qwen3_5/frontend/reasoning_loop.h
+--- a/src/models/qwen3_5/frontend/reasoning_loop.h
++++ b/src/models/qwen3_5/frontend/reasoning_loop.h
+@@ -22,15 +22,25 @@
+ 
+ namespace ninfer::models::qwen3_5 {
+ 
+-inline constexpr std::uint32_t kLoopCheckTokens = 512; // reasoning tokens between two checks
+-inline constexpr std::size_t kLoopPassageWords  = 12;  // words in one passage
+-inline constexpr std::uint32_t kLoopRepeats     = 3;   // occurrences that make a passage repeated
+-inline constexpr std::size_t kLoopWindowWords = 2000; // the recent words whose coverage is measured
+-inline constexpr std::size_t kLoopHistoryWords = 30000; // how far back passages are counted
+-inline constexpr double kLoopCoverage          = 0.25;  // coverage at which the guard fires
+-inline constexpr std::size_t kLoopTailChars    = 2048;  // reasoning characters read at the end
+-inline constexpr std::size_t kLoopTailPeriod   = 64;    // a period at most this long repeats
+-inline constexpr std::size_t kLoopCounterSteps = 8;     // periods a counter moves through at least
++inline constexpr std::uint32_t kLoopCheckTokens  = 256; // reasoning tokens between two checks
++inline constexpr std::size_t kLoopPassageWords   = 12;  // words in one passage (shared across windows)
++inline constexpr std::uint32_t kLoopRepeats      = 3;   // occurrences that make a passage repeated
++inline constexpr std::size_t kLoopWindowWords    = 2000; // long window words whose coverage is measured
++inline constexpr std::size_t kLoopShortWindow    = 512;  // early tight-loop window words
++inline constexpr std::uint32_t kLoopShortMaxTok  = 2048; // early-phase token ceiling for short window
++inline constexpr std::uint32_t kLoopShortConfirm = 2;    // consecutive short-window hits required
++inline constexpr std::size_t kLoopHistoryWords   = 30000; // how far back passages are counted
++inline constexpr double kLoopCoverage            = 0.25;  // coverage at which the long window fires
++inline constexpr double kLoopShortCoverage       = 0.35;  // tighter threshold for confirmed early check
++inline constexpr std::size_t kLoopTailChars      = 2048;  // reasoning characters read for counting/periodic tail
++inline constexpr std::size_t kLoopShortTailChars = 1024;  // early exact periodic tail length (no counter)
++inline constexpr std::size_t kLoopTailPeriod     = 64;    // a period at most this long repeats
++inline constexpr std::size_t kLoopCounterSteps   = 8;     // periods a counter moves through at least
++
++struct LoopCoverage {
++    double long_window  = 0.0;
++    double short_window = 0.0;
++};
+ 
+ // Appends the words of UTF-8 `bytes` to `words` as 64-bit hashes. A word is a run of letters,
+ // digits and '_' (ASCII letters lower-cased); every other non-space character is a word of its own,
+@@ -43,6 +53,7 @@
+ // occur at least kLoopRepeats times in `words` (the caller passes the last kLoopHistoryWords at
+ // most). Zero while fewer than kLoopWindowWords words exist.
+ [[nodiscard]] double repeated_passage_coverage(std::span<const std::uint64_t> words);
++[[nodiscard]] LoopCoverage repeated_passage_coverage_detail(std::span<const std::uint64_t> words);
+ 
+ // Appends `bytes` to the bounded tail of the reasoning that periodic_tail reads. It holds at least
+ // kLoopTailChars characters whenever that many have been emitted.
+diff --git a/src/runtime/engine/inkling2_core.cpp b/src/runtime/engine/inkling2_core.cpp
+--- a/src/runtime/engine/inkling2_core.cpp
++++ b/src/runtime/engine/inkling2_core.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/engine/inkling2_core.h"
+ 
++#include <cassert>
+ #include "artifact/formats.h"
+ #include "artifact/reader.h"
+ #include "core/arena.h"
+@@ -591,7 +592,8 @@
+         std::shared_ptr<Request> request;
+         std::vector<TokenId> fed;
+         std::vector<TokenId> anchor;
+-        bool stable_anchor = false;
++        bool stable_anchor     = false;
++        bool prompt_end_anchor = false; // true when anchor is the prompt-end BPE-mismatch snapshot
+         // The pictures among fed and anchor (an image token does not tell one from another).
+         std::vector<MediaMark> media, anchor_media;
+         // runtime::lookup_draft's copy source, as its distance from the end of `fed`.
+@@ -610,6 +612,8 @@
+         const std::uint32_t* mask                = nullptr; // a grammar's next-token mask
+         // The typed readout's token ids, on a request's first generated token only.
+         const std::vector<TokenId>* readout = nullptr;
++        // Single token id suppressed in logits (e.g. <|content_thinking|> after forced conclusion).
++        std::optional<TokenId> ban_token;
+     };
+ 
+     Inkling2Instance& instance;
+@@ -656,7 +660,9 @@
+     // budget, the least recently used dropped first. A prompt resumes from the longest stored
+     // prefix when no free sequence serves more of it.
+     struct Stored {
++        std::uint64_t id   = 0;
+         bool stable_anchor = false;
++        bool pinned        = false;
+         std::vector<TokenId> tokens;
+         std::vector<MediaMark> media;
+         models::inkling2::SequenceImage header;
+@@ -680,12 +686,14 @@
+     static constexpr double kImageCopyBytesPerSecond = 12e9;
+     static constexpr double kPrefillSecondsPerToken  = 2e-4;
+     std::vector<Stored> stored;
++    std::uint64_t next_image_id = 0;
+     std::uint64_t host_budget = 0, host_used = 0;
+     std::uint32_t decode_run                = 0;
+     std::uint32_t decode_rounds_per_prefill = 1;
+ 
+     DeviceBuffer full_sample_workspace;
+     DeviceBuffer sample_config, sample_position, sample_out, token_counts, score_targets, score_out;
++    DeviceBuffer bf16_neg_mask; // 2-byte device constant 0xC600 (-8192.0f in BF16) for ban_token
+     // A row's logits kept while its grammar mask is late (one per sequence), and those of the rows
+     // sampled together afterwards, side by side.
+     DeviceBuffer saved_logits, deferred_logits;
+@@ -781,6 +789,10 @@
+             std::make_unique<PinnedHostBuffer>(top * (sizeof(std::int32_t) + sizeof(float)));
+         const std::int32_t enabled = 1;
+         CUDA_CHECK(ninfer::copy_and_wait(logprob_flag.p, &enabled, sizeof(enabled),
++                                         cudaMemcpyHostToDevice));
++        bf16_neg_mask = DeviceBuffer(sizeof(std::uint16_t));
++        const std::uint16_t kBf16NegLarge = 0xC600U;
++        CUDA_CHECK(ninfer::copy_and_wait(bf16_neg_mask.p, &kBf16NegLarge, sizeof(kBf16NegLarge),
+                                          cudaMemcpyHostToDevice));
+         std::size_t workspace = std::max<std::size_t>(
+             {ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
+@@ -1098,6 +1110,7 @@
+             slot.anchor.clear();
+             slot.media.clear();
+             slot.anchor_media.clear();
++            slot.prompt_end_anchor = false;
+         }
+         complete(request, std::move(error));
+     }
+@@ -1124,15 +1137,21 @@
+         return static_cast<std::uint32_t>(held.size());
+     }
+ 
+-    // Frees pages for an image of `bytes`, dropping the least recently used images; false when
+-    // the budget cannot hold it at all.
++    // Frees pages for an image of `bytes`, dropping the least recently used unpinned images; false
++    // when the budget (less any pinned target image currently being restored) cannot hold it.
+     bool make_host_room(std::uint64_t bytes) {
+         const std::size_t pages = static_cast<std::size_t>((bytes + kHostPageBytes - 1) / kHostPageBytes);
+-        if (pages > host_budget / kHostPageBytes) { return false; }
++        std::size_t pinned_pages = 0;
++        for (const Stored& entry : stored) {
++            if (entry.pinned) { pinned_pages += entry.pages.size(); }
++        }
++        if (pages + pinned_pages > host_budget / kHostPageBytes) { return false; }
+         while (free_pages.size() < pages) {
+-            const auto oldest = std::min_element(stored.begin(), stored.end(), [](const Stored& a, const Stored& b) {
+-                return a.last_used < b.last_used;
+-            });
++            auto oldest = stored.end();
++            for (auto it = stored.begin(); it != stored.end(); ++it) {
++                if (it->pinned) { continue; }
++                if (oldest == stored.end() || it->last_used < oldest->last_used) { oldest = it; }
++            }
+             if (oldest == stored.end()) { return false; }
+             free_pages.insert(free_pages.end(), oldest->pages.begin(), oldest->pages.end());
+             host_used -= oldest->pages.size() * kHostPageBytes;
+@@ -1145,6 +1164,13 @@
+                                                           const std::vector<MediaMark>& media) const {
+         for (std::size_t i = 0; i < stored.size(); ++i) {
+             if (stored[i].tokens == tokens && stored[i].media == media) { return i; }
++        }
++        return std::nullopt;
++    }
++
++    [[nodiscard]] std::optional<std::size_t> stored_index_by_id(std::uint64_t id) const noexcept {
++        for (std::size_t i = 0; i < stored.size(); ++i) {
++            if (stored[i].id == id) { return i; }
+         }
+         return std::nullopt;
+     }
+@@ -1191,6 +1217,7 @@
+         const std::uint64_t bytes = executor.image_bytes(position);
+         if (!make_host_room(bytes)) { return; }
+         Stored image;
++        image.id     = ++next_image_id;
+         image.tokens = tokens;
+         image.media  = media;
+         image.path   = path;
+@@ -1215,11 +1242,15 @@
+         Slot& slot          = slots[s];
+         const bool anchored = !slot.anchor.empty() && slot.anchor.size() <= slot.fed.size() &&
+                               std::equal(slot.anchor.begin(), slot.anchor.end(), slot.fed.begin());
+-        if (anchored) {
++        const bool save_fed = slot.fed != slot.anchor && !slot.disposable;
++        // A prompt-end BPE-mismatch snapshot shares ~99% of its full-attention KV rows with `fed`:
++        // avoid doubling host PCIe traffic & footprint when `fed` is saved, and never spill
++        // disposable prompt-end anchors into host RAM.
++        if (anchored && !(slot.prompt_end_anchor && (save_fed || slot.disposable))) {
+             store_image(s, slot.anchor, slot.anchor_media, &slot.snapshot,
+                         PrefixReusePath::PrivateTurnClosure);
+         }
+-        if (slot.fed != slot.anchor && !slot.disposable) {
++        if (save_fed) {
+             store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint);
+         }
+     }
+@@ -1300,22 +1331,42 @@
+                                                  : prefix_reuse(slot.anchor, slot.anchor_media, r);
+             const auto [image, from_store] = find_stored(r);
+             if (from_store > std::max(live, anchored)) {
+-                std::vector<TokenId> tokens  = stored[image].tokens;
+-                std::vector<MediaMark> media = stored[image].media;
+-                const PrefixReusePath path   = stored[image].path;
++                const std::uint64_t target_id = stored[image].id;
++                std::vector<TokenId> tokens   = stored[image].tokens;
++                std::vector<MediaMark> media  = stored[image].media;
++                const PrefixReusePath path    = stored[image].path;
++                // Pin by immutable image id so retiring slot `s` can never evict the very image we
++                // are about to restore, and moving `tokens`/`media` cannot break unpinning.
++                stored[image].pinned = true;
++                struct UnpinGuard {
++                    Impl* self;
++                    std::uint64_t id;
++                    ~UnpinGuard() {
++                        if (const auto idx = self->stored_index_by_id(id)) {
++                            self->stored[*idx].pinned = false;
++                        }
++                    }
++                } unpin{this, target_id};
+                 retire(s);
+-                // Retiring may have dropped or moved the image: find it again.
+-                if (const auto index = stored_index(tokens, media)) {
++                if (const auto index = stored_index_by_id(target_id)) {
+                     restore_stored(s, *index);
+-                    slot.fed   = std::move(tokens);
+-                    slot.media = std::move(media);
++                    stored[*index].pinned  = false;
++                    slot.fed               = std::move(tokens);
++                    slot.media             = std::move(media);
+                     slot.anchor.clear();
+                     slot.anchor_media.clear();
+-                    reused       = from_store;
+-                    r.reuse_path = path;
++                    slot.prompt_end_anchor = false;
++                    reused                 = from_store;
++                    r.reuse_path           = path;
+                 }
+             } else if (anchored > live) {
+-                retire(s);
++                // Keep slot.anchor live on GPU without a redundant D2H copy of slot.anchor itself.
++                // When recovering from a prompt-end BPE-mismatch snapshot (`prompt_end_anchor`),
++                // `slot.fed` only holds the diverged non-canonical generation tail and does not
++                // merit a multi-GB PCIe D2H stall on the hot prefill path.
++                if (slot.fed != slot.anchor && !slot.disposable && !slot.prompt_end_anchor) {
++                    store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint);
++                }
+                 executor.restore(s, slot.snapshot);
+                 slot.fed     = slot.anchor;
+                 slot.media   = slot.anchor_media;
+@@ -1326,13 +1377,17 @@
+                 r.reuse_path = PrefixReusePath::PrivateEndpoint;
+             }
+         }
++        assert(std::none_of(stored.begin(), stored.end(), [](const Stored& e) { return e.pinned; }));
+         if (reused == 0) {
++            // Note: if stored_index_by_id missed after retire(s) above, calling retire(s) again is a
++            // harmless no-op that only bumps last_used on an already-stored prefix.
+             if (reuse_prefixes) { retire(s); }
+             executor.reset(s);
+             slot.fed.clear();
+             slot.anchor.clear();
+             slot.media.clear();
+             slot.anchor_media.clear();
++            slot.prompt_end_anchor = false;
+         }
+         slot.request    = request;
+         slot.last_used  = ++use_clock;
+@@ -1526,6 +1581,19 @@
+         const Tensor logical(sample_position.p, DType::I32, {width});
+         const Tensor logits =
+             source != nullptr ? *source : instance.executor->logits(static_cast<std::uint32_t>(n));
++        // Suppress a banned token (e.g. <|content_thinking|> after early-close conclusion) with a
++        // finite large negative BF16 value (-8192.0f = 0xC600) so exp(x - max) == 0 without
++        // triggering non-finite numerical fault guards.
++        for (std::size_t b = 0; b < n; ++b) {
++            if (rows[b].ban_token && *rows[b].ban_token >= 0 &&
++                static_cast<std::uint32_t>(*rows[b].ban_token) < domain) {
++                auto* dst = static_cast<std::uint16_t*>(logits.data) +
++                            b * static_cast<std::size_t>(logits.ne[0]) +
++                            static_cast<std::size_t>(*rows[b].ban_token);
++                CUDA_CHECK(cudaMemcpyAsync(dst, bf16_neg_mask.p, sizeof(std::uint16_t),
++                                           cudaMemcpyDeviceToDevice, stream));
++            }
++        }
+         const auto* device_configs = static_cast<const ops::SamplingConfig*>(sample_config.p);
+         const bool gather = std::any_of(rows.begin(), rows.end(),
+                                         [](const SampleRow& row) { return row.logprobs; });
+@@ -1651,7 +1719,8 @@
+                          .readout  = exec.logprobs && !exec.readout_tokens.empty() &&
+                                              r.first_token == Clock::time_point{}
+                                          ? &exec.readout_tokens
+-                                         : nullptr};
++                                         : nullptr,
++                         .ban_token = r.output.banned_token()};
+     }
+ 
+     // --expert-profile-out: every route since warm-up, rewritten at each request boundary.
+@@ -1764,11 +1833,15 @@
+             std::binary_search(r.shared_at.begin(), r.shared_at.end(), r.prefilled)) {
+             store_image(r.slot, slot.fed, slot.media, nullptr, PrefixReusePath::SharedStablePrefix);
+         }
+-        if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at && r.prefilled < prompt_n) {
++        const bool prompt_end_snap =
++            (r.prefilled == prompt_n) && !r.branches && !r.stable_prefix && !r.disposable;
++        if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at &&
++            (r.prefilled < prompt_n || prompt_end_snap)) {
+             executor.snapshot(r.slot, slot.snapshot);
+-            slot.stable_anchor = r.stable_prefix;
+-            slot.anchor       = slot.fed;
+-            slot.anchor_media = slot.media;
++            slot.stable_anchor     = r.stable_prefix;
++            slot.prompt_end_anchor = prompt_end_snap;
++            slot.anchor            = slot.fed;
++            slot.anchor_media      = slot.media;
+         }
+         if (r.observation.prompt_progress) {
+             CUDA_CHECK(ninfer::wait_for_stream(executor.head_stream()));
+@@ -1861,7 +1934,8 @@
+         if (r.branch_fed == 0) {
+             if (slot.fed == r.prompt_tokens) {
+                 if (slot.anchor != slot.fed) {
+-                    slot.stable_anchor = false;
++                    slot.stable_anchor     = false;
++                    slot.prompt_end_anchor = false;
+                     executor.snapshot(r.slot, slot.snapshot);
+                     slot.anchor       = slot.fed;
+                     slot.anchor_media = slot.media;
+@@ -2108,6 +2182,21 @@
+             return accepted;
+         }
+         r.feed.assign(1, tokens[accepted > 0 ? accepted - 1 : 0]);
++        if (decision.continuation == ContinuationAction::ApplyTargetControl) {
++            // A reached thinking budget or the loop guard's conclusion closes Inkling's thinking
++            // block: append the control span (<guidance><|end_message|>) to the next step's feed.
++            const auto pending_control = r.output.pending_control_tokens();
++            const std::vector<TokenId> control(pending_control.begin(), pending_control.end());
++            const OutputDecision forced = r.output.preview_control(control, r.budget->remaining());
++            if (forced.accepted_tokens != control.size() || forced.finished()) {
++                throw RequestError(RequestErrorKind::Unavailable,
++                                   "thinking control preview returned an invalid decision");
++            }
++            r.generated.insert(r.generated.end(), control.begin(), control.end());
++            r.budget->commit(static_cast<std::uint32_t>(control.size()));
++            push_events(r, r.output.commit_preview(), std::nullopt);
++            r.feed.insert(r.feed.end(), control.begin(), control.end());
++        }
+         if (r.cancelled.load(std::memory_order_acquire)) {
+             finish_now(request, FinishReason::Cancelled);
+         }
+@@ -2121,6 +2210,7 @@
+         // A structured row speculates while its masks are cheap enough for the round to fill its
+         // columns during the verification; otherwise it decodes plainly, a mask ahead.
+         return drafts > 0 && (!r.constrained || r.mask_cost.speculates()) && r.feed.size() == 1 &&
++               !r.output.banned_token().has_value() &&
+                r.position + drafts + 1 <= max_context &&
+                r.output.model_token_budget_remaining(r.budget->remaining()) > 1 &&
+                !(r.options.execution.post_thinking_sampling && !r.post_thinking);
+@@ -2190,7 +2280,7 @@
+     // One step of every decoding request. Those whose context or drafter proposes a continuation
+     // run one speculative round together, the rest one batched decode step.
+     void decode_step() {
+-        std::vector<std::shared_ptr<Request>> batch, speculative, drafting;
++        std::vector<std::shared_ptr<Request>> alone, batch, speculative, drafting;
+         std::vector<std::vector<TokenId>> proposals;
+         // Which of the round's proposals came from a context lookup.
+         std::vector<char> looked_up;
+@@ -2214,6 +2304,10 @@
+                 } else if (request->cancelled.load(std::memory_order_acquire)) {
+                     finish_now(request, FinishReason::Cancelled);
+                 }
++                continue;
++            }
++            if (request->feed.size() > 1) {
++                alone.push_back(request);
+                 continue;
+             }
+             const auto& phase    = request->options.execution;
+@@ -2250,7 +2344,8 @@
+             }
+             batch.push_back(request);
+         }
+-        if (batch.empty() && speculative.empty() && drafting.empty() && deferred.empty()) {
++        if (alone.empty() && batch.empty() && speculative.empty() && drafting.empty() &&
++            deferred.empty()) {
+             return;
+         }
+         const auto start = Clock::now();
+@@ -2292,21 +2387,44 @@
+             }
+         }
+         if (!deferred.empty()) { sample_deferred(deferred); }
++        for (const auto& request : alone) {
++            Request& r = *request;
++            if (r.constrained && !r.mask) { schedule_mask(r); }
++            instance.executor->forward(r.slot, r.feed, 1);
++            Slot& slot = slots[r.slot];
++            slot.fed.insert(slot.fed.end(), r.feed.begin(), r.feed.end());
++            r.position += static_cast<std::uint32_t>(r.feed.size());
++            if (!mask_ready(r)) {
++                defer_sample(r, instance.executor->logits(1), 0, ops::kSamplePurposeDecode);
++                continue;
++            }
++            const SampleRow row = sample_row(r);
++            TokenId token       = 0;
++            runtime::RawTokenLogprob logprob;
++            sample(std::span(&row, 1), ops::kSamplePurposeDecode, std::span(&token, 1),
++                   std::span(&logprob, 1));
++            try {
++                if (!mask_usable(request)) { continue; }
++                accept(request, token, row.logprobs ? &logprob : nullptr);
++                next_mask(request);
++            } catch (...) { fail(request, std::current_exception()); }
++        }
+         if (!batch.empty()) { plain_step(batch); }
+         if (!speculative.empty()) { speculative_round(speculative, proposals, looked_up); }
+-        if (width_request && width_request->position > baseline && deferred.empty()) {
++        if (width_request && width_request->position > baseline && deferred.empty() &&
++            alone.empty()) {
+             const unsigned width =
+                 proposals.empty() ? 0U : static_cast<unsigned>(proposals.front().size());
+             width_request->width_policy.observe(width, width_request->position - baseline,
+                                                 seconds(start, Clock::now()));
+         }
+-        if (measured && batch.empty() && deferred.empty()) {
++        if (measured && batch.empty() && deferred.empty() && alone.empty()) {
+             spark_controller->observe_execution(1, spark_round_width, seconds(start, Clock::now()));
+         }
+         spark_round_width = 0;
+         std::lock_guard lock(stats_mutex);
+         stats.decode_rounds += 1;
+-        stats.decode_row_rounds += batch.size() + speculative.size();
++        stats.decode_row_rounds += alone.size() + batch.size() + speculative.size();
+         stats.decode_seconds_total += seconds(start, Clock::now());
+     }
+ 
+@@ -2957,14 +3075,15 @@
+             identity.rewrite_checkpoint->frontier < prompt_n) {
+             request->anchor_at = identity.rewrite_checkpoint->frontier;
+         }
+-        // Shared prefixes worth an image of their own: a structural or declared boundary, not one
+-        // the engine merely observed (the prompt's end, a grid point).
++        // Shared prefixes worth an image of their own: explicit, requested-automatic, or structural
++        // boundaries (e.g. system prompt / tools) — NOT OpenAI's implicit DefaultAutomatic marker
++        // at prompt_n - 1, which otherwise forces a multi-GB PCIe D2H copy on every single turn
++        // even when the live GPU slot and lazy retire() already retain the conversation.
+         for (const auto& opportunity : data.context_cache.opportunities) {
+             const auto evidence   = opportunity.evidence;
+             const bool structural = has_shared_candidate_evidence(
+                 evidence, SharedCandidateEvidence::ExplicitBoundary |
+                               SharedCandidateEvidence::RequestedAutomatic |
+-                              SharedCandidateEvidence::DefaultAutomatic |
+                               SharedCandidateEvidence::EngineStructural);
+             const std::uint32_t frontier = opportunity.frontier;
+             if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix && structural &&
+diff --git a/src/serve/generation_service.cpp b/src/serve/generation_service.cpp
+--- a/src/serve/generation_service.cpp
++++ b/src/serve/generation_service.cpp
+@@ -740,7 +740,14 @@
+             prompt = engine_->prepare(std::move(input), control);
+         }
+         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+-        prepared.enable_thinking = prompt.summary().starts_in_reasoning;
++        const auto& arch = engine_->load_summary().architecture;
++        // Inkling 2 opens thinking blocks itself regardless of prompt opener, so keep its thinking
++        // budget active on all chat requests even if `enable_thinking=false` was requested.
++        const bool inkling_self_thinking =
++            !request.raw_prompt &&
++            (arch.find("Inkling") != std::string::npos ||
++             arch.find("inkling") != std::string::npos);
++        prepared.enable_thinking = prompt.summary().starts_in_reasoning || inkling_self_thinking;
+         if (!prepared.enable_thinking) {
+             request_options.execution.thinking.budget.reset();
+             prepared.thinking_budget.reset();

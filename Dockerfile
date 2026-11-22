@@ -26,7 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY --from=source /src/ ./
-COPY patches/ninfer.patch /project/patches/
+COPY patches/ninfer.patch patches/inkling2-stability-cache-ttft.patch /project/patches/
 COPY bench/quality/capture-logits.patch /project/bench/quality/
 COPY scripts/configure.sh /project/scripts/
 ARG SCORE_CAPTURE=0
